@@ -21,7 +21,7 @@ type PexelsResponse struct {
 
 func FetchImage(theme string) (string, error) {
 
-	log.Printf("🔍 Запрос к Pexels: %s (оригинал: %s)", theme)
+	log.Printf("🔍 Запрос к Pexels: %s", theme)
 
 	client := &http.Client{}
 	req, _ := http.NewRequest("GET", "https://api.pexels.com/v1/search", nil)
