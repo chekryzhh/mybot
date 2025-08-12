@@ -742,15 +742,19 @@ func handleState(update tgbotapi.Update, Bot *tgbotapi.BotAPI, s *session.Sessio
 	case "waiting_for_length":
 		s.Data["length"] = text
 		s.State = "main_menu"
+
 		var fileID string
 		if v, ok := s.Data["photo"]; ok {
 			fileID = v
 		}
-		go generatePost(s, chatID, fileID)
 
-		msg := tgbotapi.NewMessage(chatID, "✅ Пост сгенерирован!")
+		// Сообщаем, что начали работу — без фальш-«успеха»
+		msg := tgbotapi.NewMessage(chatID, "⏳ Генерирую пост, это займёт несколько секунд…")
 		msg.ReplyMarkup = bot2.MainKeyboardWithBack()
 		Bot.Send(msg)
+
+		// Генерация и публикация в фоне
+		go generatePost(s, chatID, fileID)
 
 	case "scheduling_date":
 		if !isValidDate(text) {
@@ -1265,7 +1269,12 @@ func generatePost(s *session.Session, chatID int64, fileID string) {
 	if sendErr != nil {
 		log.Printf("❌ Ошибка при публикации текста в канал %s: %v", channelUsername, sendErr)
 		Bot.Send(tgbotapi.NewMessage(chatID, "❌ Ошибка при публикации текста."))
+		return
 	}
+
+	// Если сюда дошли — всё ок
+	Bot.Send(tgbotapi.NewMessage(chatID, "✅ Пост опубликован в "+channelUsername))
+
 }
 
 func showStyleOptions(chatID int64) {
