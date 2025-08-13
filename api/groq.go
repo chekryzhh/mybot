@@ -8,7 +8,28 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
+
+/*
+ENV ПЕРЕМЕННЫЕ (пример в /opt/poster_bot/.env):
+
+# цепочка провайдеров: по порядку пробуем groq → openrouter → (можно убрать любого)
+LLM_PROVIDER_CHAIN=groq,openrouter
+
+# --- GROQ ---
+GROQ_API_KEY=...                     # обязателен для groq
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+GROQ_MODEL=llama3-70b-8192           # или, если доступно: llama-3.3-70b-versatile
+
+# --- OpenRouter (фоллбэк) ---
+OPENROUTER_API_KEY=sk-or-...         # если задан — сможем падать на openrouter
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=meta-llama/llama-3.1-70b-instruct
+
+# Поведение HTTP‑клиента
+LLM_TIMEOUT_SECONDS=30
+*/
 
 type Message struct {
 	Role    string `json:"role"`
@@ -16,9 +37,10 @@ type Message struct {
 }
 
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Temp     float64   `json:"temperature"`
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	Temperature float64   `json:"temperature,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
 }
 
 type ChatResponse struct {
@@ -27,82 +49,214 @@ type ChatResponse struct {
 			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
-func GeneratePostFromPrompt(prompt string) (string, string, error) {
-	url := "https://api.groq.com/openai/v1/chat/completions"
-	apiKey := os.Getenv("GROQ_API_KEY")
+var httpClient = &http.Client{
+	Timeout: time.Second * time.Duration(getIntEnv("LLM_TIMEOUT_SECONDS", 30)),
+}
 
-	if apiKey == "" {
-		return "", "", fmt.Errorf("GROQ_API_KEY не найден в .env")
+func getEnv(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return strings.TrimSpace(v)
 	}
+	return def
+}
 
-	// Усиленный системный промт
-	systemPrompt := `Ты профессиональный копирайтер. 
-Ты должен строго раскрывать заданную тему без отходов. 
-Не переформулируй, не упрощай и не заменяй формулировку темы. 
-Пиши конкретно, с фактами и деталями. Без воды и ИИ-стиля.
+func getIntEnv(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		var x int
+		fmt.Sscanf(v, "%d", &x)
+		if x > 0 {
+			return x
+		}
+	}
+	return def
+}
 
-В конце обязательно добавляй JSON-блок с ключевыми словами из первого предложения (на английском), без пояснений. 
+// ========================= PUBLIC API =========================
+
+func GeneratePostFromPrompt(prompt string) (string, string, error) {
+	// Системный промпт — оставил твой, слегка подчистил
+	systemPrompt := `Ты профессиональный копирайтер.
+Пиши строго по заданной теме, без воды и "ИИ‑стиля". Конкретика, факты, детали.
+В конце добавь отдельной строкой JSON с ключевыми словами (англ.), без пояснений.
 Пример: { "keywords": "technology, gadgets, innovation" }`
 
+	messages := []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: prompt},
+	}
+
+	// По цепочке провайдеров: groq → openrouter (можно менять через LLM_PROVIDER_CHAIN)
+	providers := getProviderChain()
+
+	var lastErr error
+	for _, p := range providers {
+		text, keywords, err := callProvider(p, messages, 0.7, 512)
+		if err == nil {
+			return text, keywords, nil
+		}
+		lastErr = err
+		fmt.Printf("llm[%s] error: %v\n", p, err) // виден в journalctl
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no providers configured")
+	}
+	return "", "", lastErr
+}
+
+func Translate(text string, toLang string) (string, error) {
+	if strings.TrimSpace(toLang) == "" {
+		toLang = "английский"
+	}
+
+	sys := "Ты профессиональный переводчик. Переводи точно по смыслу, без кавычек и пояснений."
+	user := fmt.Sprintf("Переведи на %s: %s", toLang, text)
+
+	messages := []Message{
+		{Role: "system", Content: sys},
+		{Role: "user", Content: user},
+	}
+
+	providers := getProviderChain()
+	var lastErr error
+	for _, p := range providers {
+		content, _, err := callProvider(p, messages, 0.3, 256)
+		if err == nil {
+			return strings.TrimSpace(content), nil
+		}
+		lastErr = err
+		fmt.Printf("llm[%s] translate error: %v\n", p, err)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no providers configured")
+	}
+	return "", lastErr
+}
+
+// ========================= CORE =========================
+
+func getProviderChain() []string {
+	raw := getEnv("LLM_PROVIDER_CHAIN", "groq,openrouter")
+	parts := strings.Split(raw, ",")
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToLower(p))
+		switch p {
+		case "groq", "openrouter":
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"groq"}
+	}
+	return out
+}
+
+func callProvider(provider string, messages []Message, temp float64, maxTokens int) (string, string, error) {
+	switch provider {
+	case "groq":
+		base := getEnv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+		model := getEnv("GROQ_MODEL", "llama3-70b-8192")
+		key := os.Getenv("GROQ_API_KEY")
+		if key == "" {
+			return "", "", fmt.Errorf("GROQ_API_KEY is empty")
+		}
+		return callOpenAICompat(base, key, model, messages, temp, maxTokens, nil)
+
+	case "openrouter":
+		base := getEnv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+		model := getEnv("OPENROUTER_MODEL", "meta-llama/llama-3.1-70b-instruct")
+		key := os.Getenv("OPENROUTER_API_KEY")
+		if key == "" {
+			return "", "", fmt.Errorf("OPENROUTER_API_KEY is empty")
+		}
+		headers := map[string]string{
+			"HTTP-Referer": "https://t.me/poster_refact_bot",
+			"X-Title":      "Poster Bot",
+		}
+		return callOpenAICompat(base, key, model, messages, temp, maxTokens, headers)
+	}
+	return "", "", fmt.Errorf("unknown provider: %s", provider)
+}
+
+// Универсальный OpenAI‑совместимый вызов /chat/completions
+func callOpenAICompat(baseURL, apiKey, model string, messages []Message, temperature float64, maxTokens int, extraHeaders map[string]string) (string, string, error) {
+	if baseURL == "" || apiKey == "" {
+		return "", "", fmt.Errorf("missing baseURL or apiKey")
+	}
+	url := strings.TrimRight(baseURL, "/") + "/chat/completions"
+
 	reqBody := ChatRequest{
-		Model: "llama3-70b-8192",
-		Messages: []Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: prompt},
-		},
-		Temp: 0.7,
+		Model:       model,
+		Messages:    messages,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+	}
+	bs, _ := json.Marshal(reqBody)
+
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(bs))
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
 	}
 
-	jsonData, err := json.Marshal(reqBody)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("ошибка маршалинга запроса: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", "", fmt.Errorf("ошибка создания запроса: %w", err)
-	}
-	req.Header.Add("Authorization", "Bearer "+apiKey)
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", fmt.Errorf("ошибка запроса: %w", err)
+		return "", "", fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", fmt.Errorf("ошибка чтения ответа: %w", err)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		// Вернём статус и кусок тела — чтобы в логах было видно истинную причину (401/404/429/400 …)
+		short := string(bodyBytes)
+		if len(short) > 400 {
+			short = short[:400] + "...(truncated)"
+		}
+		return "", "", fmt.Errorf("bad status %d: %s", resp.StatusCode, short)
 	}
 
-	var result ChatResponse
-	err = json.Unmarshal(body, &result)
-	if err != nil {
-		return "", "", fmt.Errorf("ошибка парсинга ответа: %w", err)
+	var parsed ChatResponse
+	if err := json.Unmarshal(bodyBytes, &parsed); err != nil {
+		return "", "", fmt.Errorf("json: %v; raw=%s", err, truncate(bodyBytes, 400))
+	}
+	if len(parsed.Choices) == 0 {
+		return "", "", fmt.Errorf("empty choices: %s", truncate(bodyBytes, 400))
 	}
 
-	if len(result.Choices) == 0 {
-		return "", "", fmt.Errorf("пустой ответ от модели")
-	}
-
-	fullText := result.Choices[0].Message.Content
+	fullText := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	text, keywordsJSON := splitTextAndKeywords(fullText)
 
-	var keywordData struct {
-		Keywords string `json:"keywords"`
+	// Разобрать JSON с ключевыми словами, но это необязательно — мягкий фоллбэк
+	kws := ""
+	if keywordsJSON != "" {
+		var keywordData struct {
+			Keywords string `json:"keywords"`
+		}
+		if err := json.Unmarshal([]byte(keywordsJSON), &keywordData); err == nil {
+			kws = strings.TrimSpace(keywordData.Keywords)
+		} else {
+			fmt.Printf("⚠️ keywords json parse error: %v\n", err)
+		}
 	}
-	err = json.Unmarshal([]byte(keywordsJSON), &keywordData)
-	if err != nil {
-		fmt.Println("⚠️ Ошибка парсинга ключевых слов:", err)
-		return text, "", nil // безопасный fallback
-	}
-
-	return text, keywordData.Keywords, nil
+	return text, kws, nil
 }
 
+func truncate(b []byte, n int) string {
+	s := string(b)
+	if len(s) > n {
+		return s[:n] + "...(truncated)"
+	}
+	return s
+}
+
+// Выдёргиваем из ответа последний JSON‑блок как keywords, остальное — текст поста.
 func splitTextAndKeywords(response string) (postText string, keywords string) {
 	lines := strings.Split(response, "\n")
 	var jsonLine string
@@ -115,57 +269,7 @@ func splitTextAndKeywords(response string) (postText string, keywords string) {
 			break
 		}
 	}
-
-	postText = strings.Join(lines, "\n")
-	keywords = jsonLine
+	postText = strings.TrimSpace(strings.Join(lines, "\n"))
+	keywords = strings.TrimSpace(jsonLine)
 	return
-}
-func Translate(text string, toLang string) (string, error) {
-	url := "https://api.groq.com/openai/v1/chat/completions"
-	apiKey := os.Getenv("GROQ_API_KEY")
-
-	if apiKey == "" {
-		return "", fmt.Errorf("GROQ_API_KEY не найден в .env")
-	}
-
-	prompt := fmt.Sprintf("Переведи на английский без кавычек и пояснений: %s", text)
-
-	reqBody := ChatRequest{
-		Model: "llama3-70b-8192",
-		Messages: []Message{
-			{Role: "system", Content: "Ты переводчик."},
-			{Role: "user", Content: prompt},
-		},
-		Temp: 0.3,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Add("Authorization", "Bearer "+apiKey)
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	var result ChatResponse
-	err = json.Unmarshal(body, &result)
-	if err != nil {
-		return "", err
-	}
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("пустой ответ от модели")
-	}
-
-	return strings.TrimSpace(result.Choices[0].Message.Content), nil
 }
